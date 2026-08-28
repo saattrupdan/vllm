@@ -78,9 +78,10 @@ LABEL=<configuration> benchmarks/qwen38_spark/run_serving_benchmark.sh context
 ```
 
 The wrapper performs an unmeasured warm-up and coherence check before capturing
-counters. Measured requests then use `ignore_eos=true`, temperature 0, seed 42, no
-prefix-cache reuse and no additional warm-up requests. It saves llama-benchy JSON plus
-the delta of vLLM's draft, accepted-token and per-position Prometheus counters.
+counters. Measured requests then use `ignore_eos=true`, temperature 1, top-p 0.95, top-k
+20, seed 42, no prefix-cache reuse and no additional warm-up requests. It saves
+llama-benchy JSON plus the delta of vLLM's draft, accepted-token and per-position
+Prometheus counters.
 
 Primary metrics are llama-benchy's token-generation throughput, mean accepted length and
 approximate target steps/s. Compare steps/s separately from accepted tokens/s because
@@ -141,6 +142,28 @@ Runtime commits `d7c04fc`, `03a2f8e` and `de73f11` add loader controls, PLE sepa
 and a separate MTP path. The launch script now refuses accelerated loaders without a
 filtered PLE view. Production remains on the standard safetensors loader.
 
+### Q3: Inferact NVFP4 MTP
+
+A separate 1.6 GiB draft view contains only Inferact's 6,173 MTP tensors. The target
+remains the Radix checkpoint and uses its original quantisation config.
+
+At MTP 3:
+
+- Sustained generation: **29.89 +/- 2.11 tokens/s**; range 27.29-33.05.
+- One-second peak: **44.60 +/- 0.49 tokens/s**.
+- Mean accepted length: **2.751 tokens per target step**.
+- Approximate target rate: **10.86 steps/s**.
+- Unconditional MTP acceptance: 70.53%, 56.38% and 48.23% by position.
+- Model memory: **76.07 GiB**, down from 79.42 GiB.
+- KV cache: **18.25 GiB / 645,945 tokens**, up from 15.32 GiB / 553,908.
+
+This is a **19.2% sustained gain** over BF16 MTP 2 and a 16.2% gain over BF16 MTP 3.
+Compared with BF16 MTP 3, target rate improved by 6.8% and accepted length by 8.7%.
+Quantising the draft experts therefore improved both cost and acceptance on this corpus.
+
+At MTP 4, sustained generation fell to **24.18 +/- 4.40 tokens/s**, accepted length to
+2.625 and target rate to 9.21 steps/s. MTP 3 remains the optimum among tested depths.
+
 ## Experiment queue
 
 - **B0 (complete):** Canonical current-image llama-benchy baseline.
@@ -150,7 +173,7 @@ filtered PLE view. Production remains on the standard safetensors loader.
 - **R3:** Explicit smaller KV allocation; reserve more PLE page cache.
 - **Q1:** FP8 QSA/GDN projections; remove dominant BF16 bandwidth.
 - **Q2:** FP8 LM head; avoid a 1.18 GiB BF16 scan per target row.
-- **Q3:** FP8/NVFP4 MTP; lower draft cost and permit deeper speculation.
+- **Q3 (successful):** Inferact NVFP4 MTP gives 29.89 tokens/s at depth 3.
 - **K1:** FlashInfer/TRT-LLM QSA decode; reproduce SGLang's SM121 gain.
 - **K2:** Full decode CUDA graphs after making PLE graph-safe.
 - **P1:** Asynchronous/direct PLE gather; remove GPU-CPU-GPU synchronisation.
@@ -173,7 +196,9 @@ filtered PLE view. Production remains on the standard safetensors loader.
 5. Fastsafetensors can load the body files about ten times faster, but its device
    tensors overlap model allocations and exhaust 121 GiB unified memory even after
    removing PLE from the checkpoint index. InstantTensor has the same likely risk.
-6. The current Spark CPUs already use the performance governor. The GPU runs around 2.47
+6. Inferact's isolated NVFP4 MTP draft cuts model memory by 3.35 GiB and raises
+   sustained generation by 19.2%. MTP 3 is optimal; MTP 4 loses target-step rate.
+7. The current Spark CPUs already use the performance governor. The GPU runs around 2.47
    GHz under load versus a 3.00 GHz nominal maximum and has historical software power
    and thermal throttle counters; cooling is a secondary experiment, not a substitute
    for reducing BF16 memory traffic.

@@ -57,7 +57,7 @@ common_args=(
   --concurrency 1
   --exact-tg
   --no-cache
-  --extra-body seed=42
+  --extra-body seed=42,temperature=1,top_p=0.95,top_k=20
   --exit-on-first-fail
 )
 
