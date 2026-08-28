@@ -388,7 +388,7 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
                 "please use '--mamba-cache-mode=align' instead"
             )
 
-        self.quant_config = vllm_config.quant_config
+        self.quant_config = get_draft_quant_config(vllm_config)
 
         super().__init__()
         self.config = config
@@ -404,6 +404,7 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
                 self.lm_head = ParallelLMHead(
                     config.vocab_size,
                     config.hidden_size,
+                    quant_config=self.quant_config,
                     prefix=maybe_prefix(prefix, "lm_head"),
                 )
         else:
