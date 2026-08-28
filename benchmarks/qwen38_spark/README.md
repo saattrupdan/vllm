@@ -164,6 +164,54 @@ Quantising the draft experts therefore improved both cost and acceptance on this
 At MTP 4, sustained generation fell to **24.18 +/- 4.40 tokens/s**, accepted length to
 2.625 and target rate to 9.21 steps/s. MTP 3 remains the optimum among tested depths.
 
+### Q1: Primitive mixed FP8 dense target
+
+A composite target used Primitive's mixed FP8 QSA/GDN body, Radix's FP8 mmap PLE and the
+Inferact NVFP4 MTP-3 draft. The runtime selected Cutlass FP8 dense linears, Triton GDN
+decode and FlashInfer CUTLASS NVFP4 experts.
+
+- Sustained generation: **26.29 +/- 0.54 tokens/s**.
+- Mean accepted length: **2.187 tokens per target step**.
+- Approximate target rate: **12.02 steps/s**.
+- Model memory: **73.67 GiB**; KV cache: **20.27 GiB / 716,913 tokens**.
+
+Dense FP8 improved target rate by 10.7% relative to the best Radix/NVFP4-MTP target, but
+accepted length fell by 20.5%. Its target quantisation drift made the independently
+quantised MTP agree less often, leaving throughput 12.0% below the best configuration.
+The mixed target is therefore not used in production.
+
+### Q2: dynamic FP8 LM head
+
+Runtime commit `12fd044` and image
+`sha256:0e53b90c0dcf53fe0b20a8fac51add022b92756ea810ca5ba03265098b891886` replace the
+BF16 target LM head with a non-serialised dynamic `Fp8Config` head.
+
+- Sustained generation: **26.56 +/- 2.03 tokens/s**.
+- Mean accepted length: **2.466 tokens per target step**.
+- Approximate target rate: **10.77 steps/s**.
+- One-second peak: **43.40 +/- 0.49 tokens/s**.
+
+This dynamic FP8 kernel did not improve target rate on SM121 and its logit drift reduced
+MTP agreement. It remains disabled. A serialised per-channel FP8 head may use a
+different kernel/scaling path and is not ruled out; fork commit `2fa076f90` passes
+target and draft quant configs into Qwen4Exp LM heads to support such checkpoints.
+
+### Best validated configuration
+
+The production choice after these experiments is:
+
+```text
+target=RadixArk/Qwen3.8-Flash-Next-NVFP4
+ple=RadixArk FP8 direct mmap with MADV_RANDOM
+draft=/hf/qwen38-inferact-mtp
+mtp=3
+lm_head=BF16
+gpu_memory_utilization=0.80
+```
+
+Its canonical sustained rate is **29.89 +/- 2.11 tokens/s**, 19.2% above the original
+baseline, with a 44.6 tokens/s one-second peak.
+
 ## Experiment queue
 
 - **B0 (complete):** Canonical current-image llama-benchy baseline.
@@ -171,8 +219,8 @@ At MTP 4, sustained generation fell to **24.18 +/- 4.40 tokens/s**, accepted len
 - **L1 (failed):** Accelerated loaders exceed unified-memory headroom.
 - **R2:** PLE worker count and X925 affinity; reduce host overhead.
 - **R3:** Explicit smaller KV allocation; reserve more PLE page cache.
-- **Q1:** FP8 QSA/GDN projections; remove dominant BF16 bandwidth.
-- **Q2:** FP8 LM head; avoid a 1.18 GiB BF16 scan per target row.
+- **Q1 (failed):** Mixed dense FP8 raises step rate but collapses MTP acceptance.
+- **Q2 (failed):** Dynamic FP8 head is slower and reduces MTP acceptance.
 - **Q3 (successful):** Inferact NVFP4 MTP gives 29.89 tokens/s at depth 3.
 - **K1:** FlashInfer/TRT-LLM QSA decode; reproduce SGLang's SM121 gain.
 - **K2:** Full decode CUDA graphs after making PLE graph-safe.
@@ -198,7 +246,10 @@ At MTP 4, sustained generation fell to **24.18 +/- 4.40 tokens/s**, accepted len
    removing PLE from the checkpoint index. InstantTensor has the same likely risk.
 6. Inferact's isolated NVFP4 MTP draft cuts model memory by 3.35 GiB and raises
    sustained generation by 19.2%. MTP 3 is optimal; MTP 4 loses target-step rate.
-7. The current Spark CPUs already use the performance governor. The GPU runs around 2.47
+7. Target quantisation must be evaluated with MTP acceptance, not only kernel or
+   target-step speed. Both dense FP8 and dynamic FP8-head experiments lost more accepted
+   length than they gained in step rate.
+8. The current Spark CPUs already use the performance governor. The GPU runs around 2.47
    GHz under load versus a 3.00 GHz nominal maximum and has historical software power
    and thermal throttle counters; cooling is a secondary experiment, not a substitute
    for reducing BF16 memory traffic.
