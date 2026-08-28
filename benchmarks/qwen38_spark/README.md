@@ -105,10 +105,47 @@ The earlier 35 tokens/s smoke result tracked the short-window peak, not sustaine
 throughput over coherent 512-token continuations. Future improvements are compared with
 25.08 tokens/s and 11.87 target steps/s, not the old smoke figure.
 
+### R1: MTP 3
+
+Canonical quick result with an otherwise identical server:
+
+- Sustained generation: **25.74 +/- 1.47 tokens/s**; range 23.85-27.76.
+- One-second peak: **42.00 tokens/s** in all five runs.
+- Drafts: 1,013; accepted draft tokens: 1,550 of 3,039.
+- Mean accepted length: **2.530 tokens per target step**.
+- Approximate target rate: **10.17 steps/s**.
+- Unconditional MTP acceptance: 66.83%, 48.08% and 38.10% by position.
+
+Relative to MTP 2, accepted length improved by 19.7%, target rate fell by 14.3%, and
+sustained throughput improved by only 2.6%. That is smaller than the run-to-run spread,
+so MTP 3 is not a decisive BF16-drafter win. It remains useful for testing whether a
+quantised drafter changes the optimum.
+
+### L1: accelerated model loaders
+
+Status: **unsafe on the current unified-memory checkpoint layout**.
+
+Fastsafetensors 0.3.3 with queue size 0 loaded the first 193 body/expert files in about
+43 seconds, compared with roughly 8-9 minutes for the standard loader. The unfiltered
+run then reached the 47.7 GiB PLE files, reduced available memory to 1.7 GiB and wedged
+the host, requiring a physical reboot.
+
+A second image used a filtered index with zero PLE entries and mapped PLE from the
+original snapshot. It still fell from 38 GiB available to 0.8 GiB at file 194 of 196.
+The watchdog stopped the container before another reboot. This demonstrates that
+fastsafetensors retains enough device-side body storage to overlap dangerously with the
+preallocated 78 GiB model, even without PLE. InstantTensor was not attempted because its
+vLLM iterator uses `copy=True` and has the same fundamental memory-envelope risk.
+
+Runtime commits `d7c04fc`, `03a2f8e` and `de73f11` add loader controls, PLE separation
+and a separate MTP path. The launch script now refuses accelerated loaders without a
+filtered PLE view. Production remains on the standard safetensors loader.
+
 ## Experiment queue
 
-- **B0 (running):** Canonical current-image llama-benchy baseline.
-- **R1:** MTP depth 0, 2, 3 and 4; determine the BF16 drafter optimum.
+- **B0 (complete):** Canonical current-image llama-benchy baseline.
+- **R1 (partial):** MTP 3 measured; depths 0 and 4 deferred.
+- **L1 (failed):** Accelerated loaders exceed unified-memory headroom.
 - **R2:** PLE worker count and X925 affinity; reduce host overhead.
 - **R3:** Explicit smaller KV allocation; reserve more PLE page cache.
 - **Q1:** FP8 QSA/GDN projections; remove dominant BF16 bandwidth.
@@ -133,7 +170,10 @@ throughput over coherent 512-token continuations. Future improvements are compar
 4. vLLM exports cumulative draft, accepted-token and per-position counters. The wrapper
    captures their deltas around llama-benchy, allowing acceptance and step rate to be
    separated from token-generation throughput.
-5. The current Spark CPUs already use the performance governor. The GPU runs around 2.47
+5. Fastsafetensors can load the body files about ten times faster, but its device
+   tensors overlap model allocations and exhaust 121 GiB unified memory even after
+   removing PLE from the checkpoint index. InstantTensor has the same likely risk.
+6. The current Spark CPUs already use the performance governor. The GPU runs around 2.47
    GHz under load versus a 3.00 GHz nominal maximum and has historical software power
    and thermal throttle counters; cooling is a secondary experiment, not a substitute
    for reducing BF16 memory traffic.
