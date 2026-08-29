@@ -361,9 +361,204 @@ Runtime commits `bb8e0b1` and `dc6bc6c` fix empty QSA overrides and add the opt-
 benchmark/dispatcher. The final draft-only image is
 `sha256:9219d1f7496afe0628899cdd282f11213baec21d7a5a9b409c03660c76af83fa`.
 
+### A0: harnesses used for the AutoRound comparison
+
+Two additional runners are used from A1 onwards, because the published AutoRound
+numbers come from a different harness than llama-benchy and the two are not
+comparable:
+
+- [`decode_probe.py`](decode_probe.py) is the strict metric. Each run sends the same
+  prompt twice at temperature 0 with `max_tokens` 80 and 680 and reports
+  `600 / (t_long - t_short)`, so prefill, queueing and connection setup cancel. It
+  also reports the speculative-decoding counter deltas. This reproduces the
+  `/no_think` code probe used for the FP8-hybrid results below.
+- `bench_albond.sh` is a verbatim copy of
+  [`bench_qwen35.sh`](https://github.com/albond/DGX_Spark_Qwen3.5-122B-A10B-AR-INT4/blob/master/bench_qwen35.sh),
+  the runner behind the AutoRound fork's published table. It divides completion
+  tokens by total wall clock, so it **includes** TTFT, uses thinking prompts, and
+  reports best-of-two. Its numbers are not decode throughput and must only be
+  compared with other `bench_albond.sh` numbers.
+
+The FP8-hybrid reference for both is the image `qwen38-flash-dgx:fp8-hybrid-draft-vocab2`
+(the draft-vocabulary build, measured within noise of the clean `fp8-hybrid-code`
+win at 39.01 +/- 0.19).
+
+### A1: Intel W4A16 AutoRound int4 target
+
+Status: **the AutoRound fork's claim reproduces, and it beats our NVFP4 stack.**
+
+[`Saren-Arterius/qwen3.8-Flash-DGX-AutoRound`](https://github.com/Saren-Arterius/qwen3.8-Flash-DGX-AutoRound)
+replaces the whole target checkpoint rather than the drafter: the 512-expert MoE
+becomes Intel W4A16 AutoRound int4 served through GPTQ-Marlin, the LM head becomes
+int8 GPTQ-Marlin and is shared with the in-checkpoint MTP head, and the GDN/QSA/
+shared-expert side layers become blockwise FP8. Because target and draft are
+quantised together in one checkpoint, the acceptance collapse that killed Q1, Q2 and
+K3 does not occur here.
+
+The fork was built unmodified as `qwen38-ar:base` from commit `ae4e8e6`, on the same
+base image digest as our known-good stack, and served with the prebuilt
+`Saren/Qwen3.8-Flash-Next-W4A16-AutoRound-hybrid` (70.1 GiB) and
+`Saren/Qwen3.8-Flash-Next-ple-table-fp8` (48.7 GiB) artefacts at MTP 3, prefix caching
+on, `gpu_memory_utilization=0.80` and the standard safetensors loader.
+
+Decode probe, `/no_think` code, eight runs:
+
+| Stack                         | Mean tokens/s | Stdev | Accepted length |
+| ----------------------------- | ------------: | ----: | --------------: |
+| Ours, NVFP4 + FP8 side layers |     **38.68** |  0.30 |           3.026 |
+| AutoRound int4                |     **45.24** |  3.96 |           2.908 |
+
+`bench_albond.sh`, best of two:
+
+| Probe    | Ours | AutoRound | AutoRound, published |
+| -------- | ---: | --------: | -------------------: |
+| Q&A      | 33.0 |      33.1 |                 46.1 |
+| Code     | 31.5 |      43.7 |                 49.1 |
+| JSON     | 45.3 |      57.9 |                 58.1 |
+| Math     | 40.7 |      50.3 |                 48.8 |
+| LongCode | 34.5 |      51.3 |                 47.2 |
+
+JSON, Math and LongCode reproduce or exceed the published figures; Code lands 11%
+low. Q&A is not informative in this runner because it emits only 52 tokens, so TTFT
+dominates the ratio. The honest summary is that the AutoRound recipe is **17% faster
+on strict decode** and 24-49% faster on the TTFT-inclusive runner, not 1.8x.
+
+Model memory is 71.38 GiB, down from 76.07 GiB, and KV cache is 21.77 GiB or 753,841
+tokens. Acceptance is 63.59% over 6,279 proposals with per-position rates of 78.8%,
+61.6% and 50.4%. Accepted length is slightly *lower* than ours, so the entire gain is
+target-step cost, exactly as expected from int4 experts plus an int8 head.
+
+The run-to-run spread is the other headline: stdev 3.96 against our 0.30 on an
+identical deterministic probe. Section A2 attributes it.
+
+### A2: the PLE gather dominates the remaining decode step
+
+The AutoRound fork's `VLLM_PLE_MMAP_STATS_SEC` logging makes the per-step n-gram
+lookup directly observable for the first time. During the A1 measurement:
+
+```text
+443 ops, op 3112 ms total (7.03 ms/op), gather 2578 ms total (5.82 ms/op), 33272 rows
+```
+
+There is exactly one lookup per target step, about 15 per second, and the op costs
+**3.8-15.5 ms** against a total step budget of roughly 67 ms. That is 6-24% of every
+decode step, and its variation is what produces the run-to-run spread.
+
+It is not bandwidth. Each op touches only about 75 rows, or 12 KiB. It is fault
+latency: 75 random rows in a 47.7 GiB table with less page cache than that resident
+means tens of major faults per op, and the fork's decode fast path
+(`VLLM_PLE_MMAP_FAST_ROWS`, default 512) gathers them **inline on one thread**, so
+those faults serialise at NVMe queue depth one.
+
+Giving the page cache more headroom does not fix it. Re-running A1 with
+`--kv-cache-memory-bytes 10g` moved KV from 21.77 GiB to 10 GiB and page cache from
+17 GiB to 29 GiB:
+
+| Configuration               | Mean tokens/s | Stdev |
+| --------------------------- | ------------: | ----: |
+| A1, KV 21.77 GiB / 753,841  |         45.24 |  3.96 |
+| KV 10 GiB / 321,657 tokens  |         43.63 |  4.64 |
+
+That is a null result within the spread, which is consistent with fault *latency*
+rather than fault *rate* being the cost.
+
+### A3: thread the decode PLE gather and advise random access
+
+Status: **accepted, +4.9%**.
+
+The AutoRound fork gathers decode-sized batches inline on one thread
+(`VLLM_PLE_MMAP_FAST_ROWS=512`) on the reasoning that "thread-pool dispatch costs more
+than the reads themselves". That holds only when the rows are already resident. When
+they are not, the inline loop serialises every major fault at NVMe queue depth one.
+
+Setting `VLLM_PLE_MMAP_FAST_ROWS=0` sends decode gathers through the 32-worker pool,
+and `VLLM_PLE_MMAP_MADV_RANDOM=1` restores our finding 1. Both knobs are exposed
+through `scripts/serve-intel-ar.sh` in our fork of the recipe.
+
+| Configuration                  | Mean tokens/s | Stdev | Gather ms/op |
+| ------------------------------ | ------------: | ----: | -----------: |
+| Fork defaults (inline, no advice) |     43.63 |  4.64 |    4.2--12.0 |
+| Threaded gather + `MADV_RANDOM`   | **45.75** |  4.20 |  **3.5--4.1** |
+
+The gather is not just faster, it stops varying: the per-op cost collapses to a stable
+3.5-4.1 ms instead of swinging by 3x. On `bench_albond.sh` this configuration reaches
+Code 48.8, JSON 56.1, Math 49.6, LongCode 50.8, which matches the fork's published
+table.
+
+### A4: MTP 4 is the optimum on the int4 target
+
+Status: **accepted, +4.0%**.
+
+Depth 4 lost 7% on our NVFP4 stack (the frozen matrix dropped from 28.0/27.7 to
+26.0/26.1). On the int4 target the draft step is much cheaper, and the extra position
+pays for itself:
+
+| Depth | Mean tokens/s | Stdev | Accepted length |
+| ----- | ------------: | ----: | --------------: |
+| 3     |         45.75 |  4.20 |           2.923 |
+| 4     |     **47.58** |  5.55 |       **3.450** |
+
+Fitting `T(k) = T0 + k*d` to these two points gives a 37.7 ms fixed target step and
+8.7 ms per draft position. Extrapolating position 4's acceptance from the measured
+78.8/61.6/50.4% decay predicts about 46.8 tokens/s at depth 5, so depth 5 was not run.
+
+### A5: where the decode step actually goes
+
+A 24-step `torch.profiler` capture at depth 3 (the fork's `VLLM_STEP_PROFILE=1` plus
+`/tmp/profile_trigger`) settles the question of what to optimise next. The GPU is busy
+for **86.2%** of the 72.0 ms captured step, so this is a compute problem, not a launch
+problem, and the ~9% idle matches the once-per-step 3.96 ms `vllm::ple_mmap_lookup`
+almost exactly.
+
+Kernel time splits as:
+
+| Component                                   |     ms |     % | Calls/step |
+| ------------------------------------------- | -----: | ----: | ---------: |
+| int4 GPTQ-Marlin MoE experts                | 456.3  | 27.4% |         96 |
+| Blockwise-FP8 dense linears                 | 389.7  | 23.4% |        192 |
+| **int8 Marlin LM head**                     | **257.3** | **15.4%** |    **3.8** |
+| bf16 CUTLASS GEMMs (hyper-connections etc.) | 249.7  | 15.0% |        310 |
+| bf16 MoE path (MTP layer 48 experts)        |  70.0  |  4.2% |        2.9 |
+| Elementwise, norms, FP8 scale computation   |  90.8  |  5.4% |          - |
+| GDN linear attention (Triton)               |  40.5  |  2.4% |          - |
+| QSA sparse attention and indexer            |  22.8  |  1.4% |          - |
+
+Three of these are actionable and two are not:
+
+1. The **LM head** costs 2.80 ms per call and is called once per draft position plus
+   once for verification: 15.4% at depth 3 and about 19% at depth 4. The int8 head is
+   636 MiB, so 2.80 ms is 227 GB/s against GB10's 273 GB/s peak — it is already at 83%
+   of memory bandwidth and no kernel tuning will help it. Only fewer bytes will:
+   a 4-bit head, or a reduced draft vocabulary.
+2. The **bf16 MoE path** fires once per draft position. The AutoRound
+   `quantization_config` excludes `layers.48` — the MTP layer — from int4, and the FP8
+   hybrid shim only covers dense projections, so the drafter's own 512 experts run in
+   bf16. This contradicts the fork's own precision table.
+3. The **PLE lookup** is worth up to 9%, but only if the host gather can be overlapped
+   with GPU work rather than made faster.
+
+The 310 bf16 CUTLASS calls are *not* a good target despite their 15% share: at 33 µs
+for roughly 1.6 MiB they are occupancy-limited, not bandwidth-limited, so converting
+them to FP8 would halve bytes that were never the constraint.
+
 ### Best validated configuration
 
 The production choice after these experiments is:
+
+```text
+image=qwen38-ar:base (Saren-Arterius/qwen3.8-Flash-DGX-AutoRound @ ae4e8e6)
+target=Saren/Qwen3.8-Flash-Next-W4A16-AutoRound-hybrid
+ple=Saren/Qwen3.8-Flash-Next-ple-table-fp8, separate mmap dir
+mtp=4
+lm_head=int8 GPTQ-Marlin, shared with the MTP head
+VLLM_PLE_MMAP_FAST_ROWS=0
+VLLM_PLE_MMAP_MADV_RANDOM=1
+prefix_caching=true
+gpu_memory_utilization=0.80
+```
+
+That reaches **47.58 +/- 5.55 tokens/s** on the decode probe, against **38.68 +/- 0.30**
+for the best NVFP4 configuration: a **23% improvement**. The superseded NVFP4 choice was:
 
 ```text
 target=RadixArk/Qwen3.8-Flash-Next-NVFP4
