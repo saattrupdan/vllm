@@ -196,6 +196,48 @@ MTP agreement. It remains disabled. A serialised per-channel FP8 head may use a
 different kernel/scaling path and is not ruled out; fork commit `2fa076f90` passes
 target and draft quant configs into Qwen4Exp LM heads to support such checkpoints.
 
+### K1: QSA sparse-attention profile sweep
+
+SGLang's SM121 path uses FlashInfer TRT-LLM attention over a compressed 64-token QSA
+page layout. The vLLM branch instead passes 2,051 token-level indices into a custom
+Triton kernel over 8-token main-cache pages, so the FlashInfer kernel cannot consume its
+metadata without repacking K/V or redesigning the cache.
+
+A synthetic sweep used the real Qwen dimensions (24 query heads, 2 K/V heads, head
+dimension 256) and tested Triton tile widths 16/32/64, split counts 8/16/32/64 and 2/4
+warps for both one-row draft and four-row MTP-3 verification calls.
+
+- One row: upstream **0.0358 ms**; best **0.0355 ms**.
+- Four rows: upstream **0.0363 ms**; best **0.0359 ms**.
+- Maximum BF16 output difference across valid profiles: **4.9e-4**.
+
+The roughly 1% subkernel change is too small to affect serving throughput. Runtime
+commit `199bf10` preserves an opt-in sweep harness and profile overrides, but the tuning
+image is not deployed. A useful TRT-LLM experiment requires a different QSA cache layout
+or an explicit gather benchmark, not a direct function substitution.
+
+### K2: reduced piecewise graph boundaries
+
+The mmap PLE lookup is the only host-side custom op and appears once per model forward,
+at model layer 2. An experiment therefore retained `PIECEWISE` capture but reduced
+`splitting_ops` from the known-good QSA/GDN/indexer/attention list to only
+`vllm::ple_mmap_lookup`.
+
+Compilation and checkpoint loading completed, but the first warm-up hit an asynchronous
+CUDA illegal-memory access in a captured GPU custom op. The error surfaced when the host
+PLE lookup synchronized the stream and aborted the engine. At least one QSA, GDN or
+sparse-indexer transaction in this private runtime is not graph-safe despite having a
+torch.compile fake implementation.
+
+The full known-good split list was restored. `FULL_DECODE_ONLY` remains unsafe with
+direct mmap because its CPU gather and pageable H2D copy must execute for every new
+n-gram. Further graph work requires per-op capture tests or a newer runtime with
+explicit Qwen full-graph support; do not repeat cold-start split-list bisection blindly.
+
+A same-session control before the graph test measured **27.70 +/- 2.65 tokens/s**, mean
+accepted length 2.604 and 10.64 target steps/s. During decode the GPU held 2.46-2.48 GHz
+at roughly 86-94% SM activity without a thermal-throttle event.
+
 ### Best validated configuration
 
 The production choice after these experiments is:
@@ -222,8 +264,10 @@ baseline, with a 44.6 tokens/s one-second peak.
 - **Q1 (failed):** Mixed dense FP8 raises step rate but collapses MTP acceptance.
 - **Q2 (failed):** Dynamic FP8 head is slower and reduces MTP acceptance.
 - **Q3 (successful):** Inferact NVFP4 MTP gives 29.89 tokens/s at depth 3.
-- **K1:** FlashInfer/TRT-LLM QSA decode; reproduce SGLang's SM121 gain.
-- **K2:** Full decode CUDA graphs after making PLE graph-safe.
+- **K1 (closed):** QSA Triton profile retuning changes a 0.036 ms subkernel by ~1%;
+  FlashInfer needs a different cache layout.
+- **K2 (failed):** Minimal-split piecewise capture faults in a captured QSA/GDN/indexer
+  op; full capture remains incompatible with mmap PLE.
 - **P1:** Asynchronous/direct PLE gather; remove GPU-CPU-GPU synchronisation.
 - **P2:** 28.8-32 GiB PLE; keep most or all of the table resident.
 
@@ -250,9 +294,15 @@ baseline, with a 44.6 tokens/s one-second peak.
    target-step speed. Both dense FP8 and dynamic FP8-head experiments lost more accepted
    length than they gained in step rate.
 8. The current Spark CPUs already use the performance governor. The GPU runs around 2.47
-   GHz under load versus a 3.00 GHz nominal maximum and has historical software power
-   and thermal throttle counters; cooling is a secondary experiment, not a substitute
-   for reducing BF16 memory traffic.
+   GHz under load versus a 3.00 GHz nominal maximum. A measured control held 2.46-2.48
+   GHz at 86-94% SM activity with no active thermal-throttle event, so cooling or clock
+   tuning is secondary to reducing BF16 memory traffic.
+9. vLLM's token-indexed QSA Triton attention is already only about 0.036 ms for the
+   relevant one-row and four-row calls. SGLang's TRT-LLM gain relies on a different
+   compressed-page cache layout and is not a drop-in kernel port.
+10. Compile fake implementations do not imply CUDA-graph safety. Capturing the Qwen GPU
+    custom ops by removing their split points caused an illegal memory access during
+    warm-up; direct mmap must retain the known-good piecewise split list.
 
 ## Sources
 
