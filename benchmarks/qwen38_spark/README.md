@@ -83,6 +83,11 @@ counters. Measured requests then use `ignore_eos=true`, temperature 1, top-p 0.9
 llama-benchy JSON plus the delta of vLLM's draft, accepted-token and per-position
 Prometheus counters.
 
+Results through K3 predate the explicit sampling arguments: the runner sent only
+`seed=42`, so those measurements used vLLM's unrestricted sampling defaults. Their
+within-group comparisons remain valid, but they must not be compared directly with the
+explicit top-k/top-p results in S1. The runner was corrected before the S1 baseline.
+
 Primary metrics are llama-benchy's token-generation throughput, mean accepted length and
 approximate target steps/s. Compare steps/s separately from accepted tokens/s because
 generated content can move speculative acceptance by more than 10% without a runtime
@@ -163,6 +168,46 @@ Quantising the draft experts therefore improved both cost and acceptance on this
 
 At MTP 4, sustained generation fell to **24.18 +/- 4.40 tokens/s**, accepted length to
 2.625 and target rate to 9.21 steps/s. MTP 3 remains the optimum among tested depths.
+
+These Q3 results used unrestricted sampling defaults despite the protocol text at the
+time. S1 establishes the corresponding explicit top-k/top-p baseline and production
+result.
+
+### S1: replay top-k/top-p in probabilistic draft sampling
+
+The private runtime already retained proposal probabilities for exact rejection
+sampling, but its draft sampler applied only request temperature. For requests using
+`top_k` or `top_p`, the draft could therefore propose tokens outside the target's
+filtered support, guaranteeing rejection.
+
+Runtime commit `d37e4f0` adds an opt-in path that applies the request's top-k/top-p
+filters before the draft softmax and passes those same filtered probabilities to the
+standard rejection sampler. Target-model semantics remain exact.
+
+With explicit temperature 1, top-p 0.95 and top-k 20, the unpatched five-run baseline
+was:
+
+- Sustained generation: **25.25 +/- 1.97 tokens/s**.
+- Mean accepted length: **2.372 tokens per target step**.
+- Approximate target rate: **10.64 steps/s**.
+- Draft acceptance: **45.74%**.
+
+Three replay measurements, totalling 15 runs and including a cold reboot recovery, gave:
+
+- Sustained generation: **27.77 +/- 3.09 tokens/s**; range 23.45-32.64.
+- Mean accepted length: **2.568 tokens per target step**.
+- Approximate target rate: **10.79 steps/s** across the three measurements.
+- Draft acceptance: **52.26%** across 8,973 proposals.
+- Unconditional MTP acceptance: 67.47%, 49.68% and 39.62% by position.
+
+Replay improves sustained throughput by **10.0%** and accepted length by 8.2%, without
+reducing target-step rate. A five-run unrestricted-default control on the replay image
+measured 28.29 +/- 1.96 tokens/s and 2.661 accepted tokens per target step; requests
+without top-k/top-p remain on the existing proposal path.
+
+The deployed image is `qwen38-flash-dgx:draft-topkp`, digest
+`sha256:d9655ad4cff5a5310d752ccfb6811b7ccacfab62917f4a37c9ccd9045c059b5c`. It recovered
+automatically after a host reboot and passed `/health` and `/v1/models`.
 
 ### Q1: Primitive mixed FP8 dense target
 
@@ -287,11 +332,15 @@ ple=RadixArk FP8 direct mmap with MADV_RANDOM
 draft=/hf/qwen38-inferact-mtp
 mtp=3
 lm_head=BF16
+draft_replay_top_k_top_p=1
 gpu_memory_utilization=0.80
 ```
 
-Its canonical sustained rate is **29.89 +/- 2.11 tokens/s**, 19.2% above the original
-baseline, with a 44.6 tokens/s one-second peak.
+Under unrestricted sampling defaults, the canonical Q3 rate is **29.89 +/- 2.11
+tokens/s**, with a 44.6 tokens/s one-second peak. Under the explicit reproducible
+protocol, top-k/top-p replay raises the sustained rate from **25.25 +/- 1.97** to
+**27.77 +/- 3.09 tokens/s** across 15 replay runs. These are separate sampling regimes
+and should not be combined into one improvement claim.
 
 ## Experiment queue
 
@@ -329,22 +378,27 @@ baseline, with a 44.6 tokens/s one-second peak.
 5. Fastsafetensors can load the body files about ten times faster, but its device
    tensors overlap model allocations and exhaust 121 GiB unified memory even after
    removing PLE from the checkpoint index. InstantTensor has the same likely risk.
-6. Inferact's isolated NVFP4 MTP draft cuts model memory by 3.35 GiB and raises
-   sustained generation by 19.2%. MTP 3 is optimal; MTP 4 loses target-step rate.
-7. Target quantisation must be evaluated with MTP acceptance, not only kernel or
+6. Inferact's isolated NVFP4 MTP draft cuts model memory by 3.35 GiB. Under the original
+   unrestricted-default benchmark it raised sustained generation by 19.2%. MTP 3 is
+   optimal; MTP 4 loses target-step rate.
+7. Probabilistic draft proposals must replay the target's top-k/top-p filters and retain
+   the filtered proposal probabilities for rejection sampling. This raised accepted
+   length by 8.2% and corrected-protocol throughput by 10.0% without changing target
+   semantics.
+8. Target quantisation must be evaluated with MTP acceptance, not only kernel or
    target-step speed. Both dense FP8 and dynamic FP8-head experiments lost more accepted
    length than they gained in step rate.
-8. The current Spark CPUs already use the performance governor. The GPU runs around 2.47
+9. The current Spark CPUs already use the performance governor. The GPU runs around 2.47
    GHz under load versus a 3.00 GHz nominal maximum. A measured control held 2.46-2.48
    GHz at 86-94% SM activity with no active thermal-throttle event, so cooling or clock
    tuning is secondary to reducing BF16 memory traffic.
-9. vLLM's token-indexed QSA Triton attention is already only about 0.036 ms for the
-   relevant one-row and four-row calls. SGLang's TRT-LLM gain relies on a different
-   compressed-page cache layout and is not a drop-in kernel port.
-10. Compile fake implementations do not imply CUDA-graph safety. Capturing the Qwen GPU
+10. vLLM's token-indexed QSA Triton attention is already only about 0.036 ms for the
+    relevant one-row and four-row calls. SGLang's TRT-LLM gain relies on a different
+    compressed-page cache layout and is not a drop-in kernel port.
+11. Compile fake implementations do not imply CUDA-graph safety. Capturing the Qwen GPU
     custom ops by removing their split points caused an illegal memory access during
     warm-up; direct mmap must retain the known-good piecewise split list.
-11. A faster LM-head kernel can lose end-to-end throughput through speculative
+12. A faster LM-head kernel can lose end-to-end throughput through speculative
     disagreement even when its synthetic relative RMS error is below 1.2e-4. Padded
     M=1/M=4 accumulation alignment was bit-identical for equal inputs but did not align
     target and MTP logits from different hidden states.
