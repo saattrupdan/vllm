@@ -88,6 +88,19 @@ Results through K3 predate the explicit sampling arguments: the runner sent only
 within-group comparisons remain valid, but they must not be compared directly with the
 explicit top-k/top-p results in S1. The runner was corrected before the S1 baseline.
 
+Content sensitivity is measured with the exact frozen v1 workload matrix from
+[`hasso5703/dgx-spark-qwen38`](https://github.com/hasso5703/dgx-spark-qwen38). The
+vendored [`bench_matrix_v1.sh`](bench_matrix_v1.sh) is byte-identical to upstream commit
+`34c7fa98ab4055f30569baa3c06cf85a91139237`; its SHA-256 is
+`6078517736a056fea182fea9ebc77d08f4eb38fb1afd3fe7f30255b51c069b24`. It uses eight fixed
+greedy probes and an 80-versus-680-token two-call delta to remove prefill time:
+
+```bash
+BASE_URL=http://127.0.0.1:8000 \
+MODEL=qwen3.8-flash-next API_KEY= LABEL=<configuration> \
+benchmarks/qwen38_spark/bench_matrix_v1.sh
+```
+
 Primary metrics are llama-benchy's token-generation throughput, mean accepted length and
 approximate target steps/s. Compare steps/s separately from accepted tokens/s because
 generated content can move speculative acceptance by more than 10% without a runtime
@@ -208,6 +221,32 @@ without top-k/top-p remain on the existing proposal path.
 The deployed image is `qwen38-flash-dgx:draft-topkp`, digest
 `sha256:d9655ad4cff5a5310d752ccfb6811b7ccacfab62917f4a37c9ccd9045c059b5c`. It recovered
 automatically after a host reboot and passed `/health` and `/v1/models`.
+
+### S2: frozen content workload matrix
+
+The exact upstream matrix was run unchanged against the replay image on port 8000:
+
+| Probe                         | Sustained tokens/s |
+| ----------------------------- | -----------------: |
+| Math, English                 |         unreliable |
+| Code, English                 |           **28.0** |
+| Code, German                  |           **27.7** |
+| Technical explanation, French |           **27.0** |
+| Reasoning, French             |           **36.6** |
+| Free prose, English           |           **24.8** |
+| Free prose, French            |           **24.0** |
+| Free prose, German            |           **22.1** |
+
+The math answer was too short for the matrix's reliability threshold and was correctly
+skipped. Across the complete matrix traffic, vLLM recorded 2,206 target steps, 6,618
+draft proposals and 3,364 accepted draft tokens: **50.83%** draft acceptance and
+**2.525** mean accepted length. Unconditional acceptance was 70.53%, 48.19% and 33.77%
+by position.
+
+The result confirms that one headline decode number is misleading. This vLLM
+configuration reaches 36.6 tokens/s on structured reasoning, 27.7-28.0 on code and
+22.1-24.8 on free prose. The forum SGLang profile reports 31.7-37 on code, 34.2 on
+reasoning and 20.3-24 on prose, so it is faster on code but not uniformly faster.
 
 ### Q1: Primitive mixed FP8 dense target
 
