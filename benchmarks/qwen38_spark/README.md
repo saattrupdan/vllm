@@ -372,6 +372,12 @@ comparable:
   `600 / (t_long - t_short)`, so prefill, queueing and connection setup cancel. It
   also reports the speculative-decoding counter deltas. This reproduces the
   `/no_think` code probe used for the FP8-hybrid results below.
+- [`quality_probe.py`](quality_probe.py) is a *screen*, not an evaluation: 15 fixed
+  short-answer items, exact-matched, repeated because greedy decoding on this stack is
+  nondeterministic. It catches a checkpoint change that visibly breaks the model and
+  nothing subtler; adopting any quantisation change needs a real eval.
+- [`requantize_lm_head_int4.py`](requantize_lm_head_int4.py) repacks the recipe's int8
+  GPTQ LM head to 4-bit for A6.
 - `bench_albond.sh` is a verbatim copy of
   [`bench_qwen35.sh`](https://github.com/albond/DGX_Spark_Qwen3.5-122B-A10B-AR-INT4/blob/master/bench_qwen35.sh),
   the runner behind the AutoRound fork's published table. It divides completion
@@ -541,6 +547,39 @@ The 310 bf16 CUTLASS calls are *not* a good target despite their 15% share: at 3
 for roughly 1.6 MiB they are occupancy-limited, not bandwidth-limited, so converting
 them to FP8 would halve bytes that were never the constraint.
 
+### A6: 4-bit LM head
+
+Status: **not adopted**. The step rate gain is real, the throughput gain is not.
+
+A5 showed the int8 head is 636 MiB read once per draft position plus once per
+verification, at 83% of GB10's memory bandwidth. The only remaining lever is fewer
+bytes, so the head was requantised to 4-bit GPTQ (group 128, full-range symmetric)
+with `tools/requantize_lm_head_int4.py` in our fork of the recipe, halving the shard
+from 633 to 328 MiB. Mean absolute requantisation error is **11.79% of |w|**, against
+roughly 0.9% for the int8 head.
+
+| Head | Mean tokens/s | Stdev | Accepted length | Target steps/s |
+| ---- | ------------: | ----: | --------------: | -------------: |
+| int8 |         47.58 |  5.55 |           3.450 |          13.79 |
+| int4 |         48.52 |  3.80 |           3.233 |      **15.01** |
+
+Target-step rate rose **8.9%**, close to the predicted gain from halving the head's
+bytes, which confirms the profile's attribution. But accepted length fell 6.3%, and
+the two effects cancel: 48.52 against 47.58 over ten runs each, with a standard error
+of about 1.3, is not a measurable difference.
+
+The mechanism is the K3 mechanism again. Even though target and draft share one head,
+they feed it different hidden states, so the head's quantisation noise perturbs their
+logits independently and they agree less often. A screening probe of 15 short-answer
+items at two repeats scored 30/30, but that screen is far too easy to discriminate
+head precisions and should not be read as a quality result.
+
+The useful conclusion is that the head **is** worth attacking, but not by adding
+numerical error. Restricting the *draft* head to a pruned vocabulary keeps int8
+numerics exactly and cuts the same bytes; unlike the earlier bf16 attempt, the GPTQ
+`qweight` layout here is `[in/4, out]`, so the vocabulary axis can be sliced directly
+before the Marlin repack.
+
 ### Best validated configuration
 
 The production choice after these experiments is:
@@ -592,8 +631,22 @@ and should not be combined into one improvement claim.
   op; full capture remains incompatible with mmap PLE.
 - **K3 (failed):** SM121 skinny-GEMM heads raise step rate but reduce MTP acceptance;
   draft-only mode has no serving speedup.
-- **P1:** Asynchronous/direct PLE gather; remove GPU-CPU-GPU synchronisation.
-- **P2:** 28.8-32 GiB PLE; keep most or all of the table resident.
+- **P1 (partially closed):** A3 threads the decode gather; the remaining ~4 ms is a
+  host stall that must be *overlapped*, not shortened.
+- **P2 (closed, null):** A2 shows extra page-cache headroom does not help; the cost is
+  fault latency, not fault rate.
+- **A1 (successful):** Intel W4A16 AutoRound int4 target, 45.24 tokens/s at depth 3.
+- **A3 (successful):** Threaded PLE gather plus `MADV_RANDOM`, +4.9%.
+- **A4 (successful):** MTP depth 4 on the int4 target, +4.0%.
+- **A6 (failed):** 4-bit LM head buys 8.9% step rate and loses it to acceptance.
+- **A7:** Pruned-vocabulary draft head; same int8 numerics, half the head bytes.
+- **A8:** Quantise the MTP layer's own 512 experts. AutoRound excludes `layers.48`, so
+  the drafter's MoE runs bf16 and costs one bf16 GEMM per draft position.
+- **A9:** Port `d37e4f0` draft top-k/top-p replay onto the AutoRound stack. Both
+  benchmarks here are greedy, so S1's 10% is currently unmeasured on this target.
+- **A10:** Greedy decoding is nondeterministic on this stack
+  (`VLLM_MARLIN_USE_ATOMIC_ADD=1`). Repeated identical prompts give different answers,
+  which is both a quality question and the reason measurement spread is 4-5 tokens/s.
 
 ## Findings
 
@@ -636,6 +689,20 @@ and should not be combined into one improvement claim.
     disagreement even when its synthetic relative RMS error is below 1.2e-4. Padded
     M=1/M=4 accumulation alignment was bit-identical for equal inputs but did not align
     target and MTP logits from different hidden states.
+13. Quantising the *target* only pays when the drafter is quantised in the same
+    checkpoint. Q1, Q2 and K3 all lost more accepted length than they gained in step
+    rate because target and draft were quantised independently. The AutoRound recipe
+    wins because one checkpoint carries both.
+14. Published single-number decode claims are not comparable across harnesses. The
+    AutoRound fork's 49 tokens/s and our 38.7 tokens/s were measured by runners that
+    differ by roughly 25% on the *same* server; only same-runner comparisons are used
+    above.
+15. An mmap gather that is fast when resident can be the slowest thing in the step when
+    it is not. The fork's inline decode fast path serialises major faults; threading it
+    made the per-op cost both lower and stable (finding A3).
+16. The int8 LM head runs at 83% of GB10's memory bandwidth, so it cannot be tuned,
+    only shrunk -- and shrinking it by adding numerical error does not pay (A6). The
+    only shrink that preserves acceptance is a smaller draft vocabulary.
 
 ## Sources
 
