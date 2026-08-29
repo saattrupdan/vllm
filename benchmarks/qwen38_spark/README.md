@@ -597,7 +597,9 @@ gpu_memory_utilization=0.80
 ```
 
 That reaches **47.58 +/- 5.55 tokens/s** on the decode probe, against **38.68 +/- 0.30**
-for the best NVFP4 configuration: a **23% improvement**. The superseded NVFP4 choice was:
+for the best NVFP4 configuration: a **23% improvement**. An independent confirmation
+run after a cold restart measured **47.76 +/- 5.15 tokens/s** with accepted length
+3.471 and 15/15 on the quality screen. The superseded NVFP4 choice was:
 
 ```text
 target=RadixArk/Qwen3.8-Flash-Next-NVFP4
