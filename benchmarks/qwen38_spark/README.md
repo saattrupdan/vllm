@@ -238,6 +238,45 @@ A same-session control before the graph test measured **27.70 +/- 2.65 tokens/s*
 accepted length 2.604 and 10.64 target steps/s. During decode the GPU held 2.46-2.48 GHz
 at roughly 86-94% SM activity without a thermal-throttle event.
 
+### K3: SM121 skinny-GEMM LM head
+
+The private runtime ships vLLM's CuTe DSL shape-dynamic skinny GEMM, but Qwen enables it
+only for SM103 with TP4-specific plans. The TP1 target and MTP drafter each own a BF16
+`248320 x 2560` LM head. An SM121 autotune found the same M=4 plan for target
+verification and padded one-row draft calls:
+
+```text
+SkinnyGemmConfig(4, 128, 2, k_unroll=4, vector_width=4)
+```
+
+Synthetic full-head timings were:
+
+- M=1 cuBLAS: **7.43 ms**; best skinny GEMM: **5.14 ms** (**1.44x**).
+- M=4 cuBLAS: **5.35 ms**; best skinny GEMM: **5.10 ms** (**1.05x**).
+- Relative RMS error: 1.8e-5 at M=1 and 1.1e-4 at M=4.
+
+Padding M=1 to four rows and using the M=4 kernel made draft row 0 bit-identical to row
+0 of target M=4 across all 248,320 synthetic logits. It did not, however, preserve
+agreement between the different target and MTP hidden states in serving.
+
+| Variant                           | Sustained tokens/s | Accepted length | Target steps/s |
+| --------------------------------- | -----------------: | --------------: | -------------: |
+| Same-session cuBLAS control       |     27.70 +/- 2.65 |           2.604 |          10.64 |
+| Separate M=1/M=4 skinny plans     |     26.98 +/- 1.59 |           2.418 |          11.16 |
+| Both heads, aligned M=4 plan      |     27.97 +/- 4.26 |           2.424 |          11.54 |
+| Draft head only, aligned M=4 plan |     25.78 +/- 3.04 |           2.423 |          10.64 |
+| Canonical Q3 result               | **29.89 +/- 2.11** |       **2.751** |          10.86 |
+
+Replacing both heads raised target-step rate by 8.5% relative to the same-session
+control, but numerical drift reduced speculative acceptance by 6.9%. Restricting the
+kernel to the draft preserved target-model semantics but removed the step-rate gain and
+still reduced acceptance. None of the variants beats the canonical configuration, so
+production retains cuBLAS for both BF16 heads.
+
+Runtime commits `bb8e0b1` and `dc6bc6c` fix empty QSA overrides and add the opt-in SM121
+benchmark/dispatcher. The final draft-only image is
+`sha256:9219d1f7496afe0628899cdd282f11213baec21d7a5a9b409c03660c76af83fa`.
+
 ### Best validated configuration
 
 The production choice after these experiments is:
@@ -268,6 +307,8 @@ baseline, with a 44.6 tokens/s one-second peak.
   FlashInfer needs a different cache layout.
 - **K2 (failed):** Minimal-split piecewise capture faults in a captured QSA/GDN/indexer
   op; full capture remains incompatible with mmap PLE.
+- **K3 (failed):** SM121 skinny-GEMM heads raise step rate but reduce MTP acceptance;
+  draft-only mode has no serving speedup.
 - **P1:** Asynchronous/direct PLE gather; remove GPU-CPU-GPU synchronisation.
 - **P2:** 28.8-32 GiB PLE; keep most or all of the table resident.
 
@@ -303,6 +344,10 @@ baseline, with a 44.6 tokens/s one-second peak.
 10. Compile fake implementations do not imply CUDA-graph safety. Capturing the Qwen GPU
     custom ops by removing their split points caused an illegal memory access during
     warm-up; direct mmap must retain the known-good piecewise split list.
+11. A faster LM-head kernel can lose end-to-end throughput through speculative
+    disagreement even when its synthetic relative RMS error is below 1.2e-4. Padded
+    M=1/M=4 accumulation alignment was bit-identical for equal inputs but did not align
+    target and MTP logits from different hidden states.
 
 ## Sources
 
