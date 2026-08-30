@@ -731,6 +731,81 @@ the per-scenario event streams -- are kept outside the repository at
 `~/qwen38-teb-results/` on the workstation, per this log's convention of not tracking raw
 benchmark output.
 
+### C1: concurrency and the admission cap (prepared, not yet run)
+
+Every measurement in this log so far is single-stream. `max_num_seqs=8` was inherited
+from the fork's `serve-intel-ar.sh` and has never been examined, and offering many
+parallel requests visibly degrades service. This experiment separates two questions that
+the decode probe cannot distinguish: how aggregate throughput scales with *offered
+load*,
+and whether the *admission cap* is what limits it.
+
+The relevant structural facts are `--max-num-seqs 8`, `--max-num-batched-tokens 8192`
+with chunked prefill, 15.32 GiB of KV cache (about 554,000 tokens), and `PIECEWISE`
+capture with `vllm::ple_mmap_lookup` in `splitting_ops`.
+
+Ranked hypotheses, each with the observation that would confirm it:
+
+- **H1, queueing.** Beyond 8 in-flight requests the rest simply wait. Aggregate
+  throughput is flat past concurrency 8, TTFT grows linearly, and per-stream decode rate
+  is unchanged for admitted requests. This is the dull explanation and the most likely
+  one; the fix is to raise `SEQS`.
+- **H2, speculative verify cost.** Each step verifies `batch * (mtp + 1)` tokens. At
+  batch 1 the draft passes are memory-bound and nearly free; as the batch grows they
+  become compute-bound, so speculation's payoff shrinks and can inverse. Confirmed by
+  accepted length holding roughly constant while target step rate falls faster than
+  `1/batch`. The fix would be `num_speculative_tokens_per_batch_size`, which exists in
+  this tree but must be confirmed present in the vendored build.
+- **H3, the PLE gather, predicted to *help*.** A2 and A5 showed the gather is bound by
+  page-fault latency at NVMe queue depth 1, not by bandwidth. Concurrency raises queue
+  depth: `batch * (mtp + 1)` independent row fetches for the 32 workers to issue at
+  once.
+  So per-token PLE cost should *fall* with concurrency, and better-than-linear scaling
+  below the cap would be the signature.
+- **H4, KV pressure.** 554,000 KV tokens is not binding for short prompts at batch 32,
+  only for long contexts. The `vllm:num_preemptions_total` delta settles it.
+- **H5, graph fallback.** Batches above the largest captured size run eager. Capture
+  sizes should track `max_num_seqs`, but this `PIECEWISE` plus `splitting_ops` setup is
+  unusual, so the startup log's capture list is worth reading when `SEQS` changes.
+
+The runner is `concurrency_sweep.sh`, which drives `vllm bench serve` inside the serving
+container over loopback. With no arguments it sweeps offered load against the running
+server; given `SERVE_SCRIPT` and `SEQS_LIST` it restarts the server per admission cap
+and
+sweeps each. `concurrency_report.py` renders the results.
+
+```bash
+# H1: offered-load curve against the current server, no restarts
+benchmarks/qwen38_spark/concurrency_sweep.sh
+
+# admission-cap matrix
+SERVE_SCRIPT=~/qwen38-autoround/scripts/serve-intel-ar.sh \
+  SEQS_LIST="4 8 16 32 64" benchmarks/qwen38_spark/concurrency_sweep.sh
+
+benchmarks/qwen38_spark/concurrency_report.py
+```
+
+Two protocol choices matter. The sweep uses `/v1/completions`, not the chat endpoint:
+the server runs `--reasoning-parser qwen3`, which routes generated text to
+`reasoning_content`, and `vllm bench serve`'s chat backend counts only `delta.content`,
+so every inter-token latency would be wrong. It also uses the `sonnet` corpus rather
+than
+`random`, because the PLE gather's cost depends on n-gram locality and uniformly random
+token ids are a pathological worst case that would overstate H3.
+
+Each point issues `max(8, 4 * concurrency)` requests of 550 prompt tokens and exactly
+256
+output tokens under `--ignore-eos`, after a warm-up pass at the same concurrency to
+capture the matching graph. Aggregate and per-stream throughput are reported separately
+because they move in opposite directions; the decision rule is to maximise aggregate
+tokens/s subject to a floor on per-stream tokens/s, and that floor is a product choice
+rather than a measurement.
+
+One caveat carried over from A7: single-stream spread on this stack is 3-4.5 tokens/s,
+so
+differences of a few percent between adjacent `SEQS` values will not be resolvable and
+should not be reported as wins.
+
 ### Best validated configuration
 
 The production choice after these experiments is:
@@ -806,6 +881,8 @@ and should not be combined into one improvement claim.
   the drafter's MoE runs bf16 and costs one bf16 GEMM per draft position.
 - **A9:** Port `d37e4f0` draft top-k/top-p replay onto the AutoRound stack. Both
   benchmarks here are greedy, so S1's 10% is currently unmeasured on this target.
+- **C1 (prepared):** Concurrency and the admission cap. `max_num_seqs=8` is inherited
+  from the fork and unexamined; every result in this log is single-stream.
 - **A10:** Greedy decoding is nondeterministic on this stack
   (`VLLM_MARLIN_USE_ATOMIC_ADD=1`). Repeated identical prompts give different answers,
   which is both a quality question and the reason measurement spread is 4-5 tokens/s.
