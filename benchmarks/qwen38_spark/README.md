@@ -809,10 +809,13 @@ so every inter-token latency would be wrong. It also uses the `sonnet` corpus ra
 than `random`, because the PLE gather's cost depends on n-gram locality and uniformly
 random token ids are a pathological worst case that would overstate H3.
 
-Each point issues `max(8, 4 * min(concurrency, cap))` requests of 550 prompt tokens and
-exactly 256 output tokens under `--ignore-eos`, after a warm-up pass at the same
-concurrency to capture the matching graph. Aggregate and per-stream throughput are
-reported separately because they move in opposite directions.
+Each point issues `clamp(2 * min(concurrency, cap), 8, 96)` requests of 550 prompt
+tokens and exactly 256 output tokens under `--ignore-eos`, after a warm-up pass at the
+same concurrency to capture the matching graph. Two rounds of concurrent decode is
+enough for a stable mean once repeats supply the error bars, and the sizing matters more
+than it looks: a smoke point measured aggregate throughput as roughly flat in
+concurrency, so work per point converts almost directly into wall clock. Aggregate and
+per-stream throughput are reported separately because they move in opposite directions.
 
 The decision rule for this run is **maximum aggregate tokens/s with no per-stream
 floor**, chosen deliberately so the selection can be made without a human present. It is

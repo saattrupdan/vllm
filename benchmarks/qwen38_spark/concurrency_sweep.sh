@@ -31,8 +31,8 @@
 # that contention shows up as a client-side bottleneck.
 set -euo pipefail
 
-container="${CONTAINER:-qwen38-flash}"
-port="${PORT:-18300}"
+container="${CONTAINER:-qwen38-ar}"
+port="${PORT:-8000}"
 model="${MODEL:-qwen3.8-flash-next}"
 tokenizer="${TOKENIZER:-/model}"
 metrics_url="${METRICS_URL:-http://127.0.0.1:${port}/metrics}"
@@ -46,8 +46,14 @@ repeats="${REPEATS:-1}"
 input_len="${INPUT_LEN:-550}"
 output_len="${OUTPUT_LEN:-256}"
 prefix_len="${PREFIX_LEN:-50}"
-prompts_per_slot="${PROMPTS_PER_SLOT:-4}"
+# Two rounds of concurrent decode per point is enough for a stable mean when
+# repeats supply the error bars, and the smoke test showed aggregate throughput
+# is roughly flat in concurrency on this stack -- so work per point translates
+# almost directly into wall clock, and four prompts per slot would have put a
+# single cap-64 point at over twenty minutes.
+prompts_per_slot="${PROMPTS_PER_SLOT:-2}"
 min_prompts="${MIN_PROMPTS:-8}"
+max_prompts="${MAX_PROMPTS:-96}"
 client_cpus="${CLIENT_CPUS:-}"
 
 # Requests beyond the admission cap queue rather than adding throughput, so
@@ -106,9 +112,11 @@ preflight() {
   [[ -f "${sonnet_src}" ]] || die "sonnet corpus not found: ${sonnet_src}"
 
   # The container ships the fork's vendored vLLM, not this checkout. Fail here
-  # with a readable message rather than midway through the matrix.
+  # with a readable message rather than midway through the matrix. Bare --help
+  # only lists group names on this build, so ask for the groups by name.
   local help
-  help="$(docker exec "${container}" vllm bench serve --help 2>&1)" \
+  help="$(docker exec "${container}" vllm bench serve --help=options 2>&1
+    docker exec "${container}" vllm bench serve --help='sonnet dataset options' 2>&1)" \
     || die "'vllm bench serve' unavailable in ${container}"
   local flag
   for flag in --max-concurrency --sonnet-input-len --sonnet-prefix-len \
@@ -182,6 +190,7 @@ run_point() {
   ((seqs_cap > 0 && conc > seqs_cap)) && slots="${seqs_cap}"
   local prompts=$((prompts_per_slot * slots))
   ((prompts < min_prompts)) && prompts="${min_prompts}"
+  ((prompts > max_prompts)) && prompts="${max_prompts}"
 
   local name="${arm}-c${conc}-r${repeat}"
   local before="${work_dir}/before" after="${work_dir}/after"

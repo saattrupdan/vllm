@@ -17,7 +17,7 @@ set -euo pipefail
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
-serve_script="${SERVE_SCRIPT:-${HOME}/qwen38-autoround/scripts/serve-intel-ar.sh}"
+serve_script="${SERVE_SCRIPT:-${HOME}/qwen38-spark-benchmark/serve-c1.sh}"
 seqs_list="${SEQS_LIST:-8 4 2 6 16 32 64}"
 repeats="${REPEATS:-4}"
 hours="${HOURS:-8}"
@@ -32,7 +32,7 @@ restore_seqs="${RESTORE_SEQS:-}"
 # variable only.
 export MTP="${MTP:-3}"
 
-port="${PORT:-18300}"
+port="${PORT:-8000}"
 health_url="http://127.0.0.1:${port}/health"
 
 log() { printf '[%s] %s\n' "$(date '+%F %T')" "$*"; }
