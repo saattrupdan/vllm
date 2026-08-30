@@ -737,8 +737,7 @@ Every measurement in this log so far is single-stream. `max_num_seqs=8` was inhe
 from the fork's `serve-intel-ar.sh` and has never been examined, and offering many
 parallel requests visibly degrades service. This experiment separates two questions that
 the decode probe cannot distinguish: how aggregate throughput scales with *offered
-load*,
-and whether the *admission cap* is what limits it.
+load*, and whether the *admission cap* is what limits it.
 
 The relevant structural facts are `--max-num-seqs 8`, `--max-num-batched-tokens 8192`
 with chunked prefill, 15.32 GiB of KV cache (about 554,000 tokens), and `PIECEWISE`
@@ -771,8 +770,7 @@ Ranked hypotheses, each with the observation that would confirm it:
 The runner is `concurrency_sweep.sh`, which drives `vllm bench serve` inside the serving
 container over loopback. With no arguments it sweeps offered load against the running
 server; given `SERVE_SCRIPT` and `SEQS_LIST` it restarts the server per admission cap
-and
-sweeps each. `concurrency_report.py` renders the results.
+and sweeps each. `concurrency_report.py` renders the results.
 
 ```bash
 # H1: offered-load curve against the current server, no restarts
@@ -780,31 +778,58 @@ benchmarks/qwen38_spark/concurrency_sweep.sh
 
 # admission-cap matrix
 SERVE_SCRIPT=~/qwen38-autoround/scripts/serve-intel-ar.sh \
-  SEQS_LIST="4 8 16 32 64" benchmarks/qwen38_spark/concurrency_sweep.sh
+  SEQS_LIST="8 4 2 6 16 32 64" REPEATS=4 \
+  benchmarks/qwen38_spark/concurrency_sweep.sh
 
 benchmarks/qwen38_spark/concurrency_report.py
+```
+
+The caps run low-first because the working hypothesis on the box is that the optimum is
+*below* the shipped 8, not above it, and because the arms are ordered so that a run cut
+short still holds the shipped baseline and its nearest neighbours. Requests offered
+beyond the cap only queue, so each point sizes its request count by `min(concurrency,
+cap)`; that holds every point at roughly constant duration instead of letting
+concurrency 64 against a cap of 2 run for a quarter of an hour.
+
+For an unattended run, `overnight_concurrency.sh` wraps the matrix: it sweeps, picks the
+cap with the highest mean aggregate throughput, redeploys the server on it, and writes a
+summary. It reserves 20 minutes at the end for the redeploy so the box is never left
+without a healthy server, falls back to the shipped cap of 8 if the winning cap will not
+start, and honours a wall-clock budget rather than overrunning.
+
+```bash
+tmux new-session -d -s c1 \
+  'benchmarks/qwen38_spark/overnight_concurrency.sh 2>&1 | tee ~/c1.log'
 ```
 
 Two protocol choices matter. The sweep uses `/v1/completions`, not the chat endpoint:
 the server runs `--reasoning-parser qwen3`, which routes generated text to
 `reasoning_content`, and `vllm bench serve`'s chat backend counts only `delta.content`,
 so every inter-token latency would be wrong. It also uses the `sonnet` corpus rather
-than
-`random`, because the PLE gather's cost depends on n-gram locality and uniformly random
-token ids are a pathological worst case that would overstate H3.
+than `random`, because the PLE gather's cost depends on n-gram locality and uniformly
+random token ids are a pathological worst case that would overstate H3.
 
-Each point issues `max(8, 4 * concurrency)` requests of 550 prompt tokens and exactly
-256
-output tokens under `--ignore-eos`, after a warm-up pass at the same concurrency to
-capture the matching graph. Aggregate and per-stream throughput are reported separately
-because they move in opposite directions; the decision rule is to maximise aggregate
-tokens/s subject to a floor on per-stream tokens/s, and that floor is a product choice
-rather than a measurement.
+Each point issues `max(8, 4 * min(concurrency, cap))` requests of 550 prompt tokens and
+exactly 256 output tokens under `--ignore-eos`, after a warm-up pass at the same
+concurrency to capture the matching graph. Aggregate and per-stream throughput are
+reported separately because they move in opposite directions.
+
+The decision rule for this run is **maximum aggregate tokens/s with no per-stream
+floor**, chosen deliberately so the selection can be made without a human present. It is
+not the only defensible rule: a floor on per-stream tokens/s would generally pick a
+smaller cap, and the report prints the per-stream cost beside every winner so that
+tradeoff stays visible. MTP is held at 3 throughout, so the cap is the only variable;
+the C-versus-D quality question from A8 is untouched by this experiment.
+
+Each point is repeated four times and reported as mean +/- sample stdev. The report
+treats an arm as having reached its plateau within 2% of its best mean, per A7, and
+reports the smallest concurrency that gets there -- past the cap, extra offered load
+only queues, so the highest single mean is otherwise an arbitrary point chosen by noise,
+and the latency columns beside it would describe a deep queue rather than the knee.
 
 One caveat carried over from A7: single-stream spread on this stack is 3-4.5 tokens/s,
-so
-differences of a few percent between adjacent `SEQS` values will not be resolvable and
-should not be reported as wins.
+so differences of a few percent between adjacent `SEQS` values will not be resolvable
+and should not be reported as wins.
 
 ### Best validated configuration
 
