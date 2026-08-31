@@ -883,12 +883,50 @@ Hypothesis outcomes:
   length is 2.48-2.59 across every cap and every offered load, so batch size does not
   move MTP acceptance at all. Whatever the verify costs at large batch, it is compute,
   not acceptance, and `num_speculative_tokens_per_batch_size` is not indicated.
-- **H3, the PLE gather helping: not supported.** Scaling is sublinear throughout, with
-  no superlinear region that would indicate the gather benefiting from queue depth.
+- **H3, the PLE gather helping: not tested here; upstream says yes.** This log first
+  recorded H3 as "not supported" because aggregate scaling is sublinear with no
+  superlinear region. That was the wrong test: the gather getting cheaper per token does
+  not produce superlinear aggregate scaling, because compute still grows with batch, so
+  sublinearity is no evidence either way. The right instrument is the fault rate, which
+  this sweep never captured. @jschmied measured it directly on a GB10 and found major
+  faults per token falling 16.0 to 3.6, a 4.4x drop from 1 to 48 streams, with the gather
+  never exceeding about 25% of one CPU core. H3 should be treated as supported on that
+  evidence, not on ours.
 - **H4, KV pressure: ruled out for this workload, but only for this workload.** Zero
   preemptions at every point. That is because prompts were 550 tokens: 746,756 KV tokens
   over 32 sequences leaves about 23,000 each, ample here. See the caveat below.
 - **H5, graph fallback: ruled out.** Capture tracks the cap -- 35 sizes, 0.36 GiB, 35 s.
+
+#### C1 against upstream's own concurrency numbers
+
+`blazux/qwen3.8-Flash-DGX` published concurrency findings of its own (from @jschmied,
+[qwen38-flash-next-gb10](https://github.com/jschmied/qwen38-flash-next-gb10)) after the
+commit this log pins. They agree with C1 on the mechanism and disagree on the ceiling:
+
+| Streams | Their aggregate tok/s | Their per stream | Major faults/token |
+|---:|---:|---:|---:|
+| 1 | 17.1 | 17.1 | 16.0 |
+| 8 | 87.5 | 10.9 | 7.0 |
+| 16 | 131.6 | 8.2 | 9.6 |
+| 32 | 212.0 | 6.6 | 4.3 |
+| 48 | **266.8** | 5.6 | 3.6 |
+
+Absolute rates are not comparable: their run is RadixArk NVFP4 at 8k context using vLLM's
+native PLE CPU offload rather than this repo's mmap, and crucially **without speculative
+decoding**. The shapes are what matter. On H1 they independently reproduce C1 exactly --
+at `--max-num-seqs 2` their sweep flatlines near 33 tokens/s while
+`vllm:request_queue_time_seconds_sum` climbs to 142 s, and their README now warns against
+benchmarking at 1-2 for that reason.
+
+The disagreement is the ceiling, and it is the most valuable thing here. C1 plateaus at
+180 tokens/s by cap 32; they are still climbing at 48 streams and reach 266.8. The
+salient difference is MTP. C1's H2 established that batch size does not move MTP
+*acceptance*, but said nothing about the compute cost of verifying `batch * (mtp + 1)`
+tokens per step, and that cost grows with batch while the benefit does not. Their
+no-speculation run climbing past where our MTP-3 run stalls is the first concrete evidence
+that **speculative decoding may be net-negative at high concurrency on this stack**. That
+makes the MTP-versus-cap sweep, deliberately skipped in C1 in favour of repeats, the
+clear next experiment: MTP 0 against MTP 3 at caps 32 and 48.
 
 Two caveats limit how far this generalises. Prompts were 550 tokens and outputs exactly
 256, so the zero-preemption result says nothing about long contexts: at cap 32 the KV
