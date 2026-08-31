@@ -731,7 +731,7 @@ the per-scenario event streams -- are kept outside the repository at
 `~/qwen38-teb-results/` on the workstation, per this log's convention of not tracking raw
 benchmark output.
 
-### C1: concurrency and the admission cap (prepared, not yet run)
+### C1: concurrency and the admission cap
 
 Every measurement in this log so far is single-stream. `max_num_seqs=8` was inherited
 from the fork's `serve-intel-ar.sh` and has never been examined, and offering many
@@ -834,6 +834,70 @@ One caveat carried over from A7: single-stream spread on this stack is 3-4.5 tok
 so differences of a few percent between adjacent `SEQS` values will not be resolvable
 and should not be reported as wins.
 
+#### C1 results
+
+Seven admission caps, seven offered-load levels each, four passes per point: 301 minutes
+unattended on the arm-C server (AutoRound int4 hybrid, MTP 3, `MADV_RANDOM`, prefix
+caching, `GPU_MEM=0.80`, 746,756 KV tokens). Aggregate output tokens/s, mean +/- sample
+stdev over four passes:
+
+| Offered | seqs2 | seqs4 | seqs6 | seqs8 | seqs16 | seqs32 | seqs64 |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 36.4 +/- 1.3 | 37.1 +/- 1.8 | 36.8 +/- 1.3 | 38.0 +/- 2.2 | 36.1 +/- 1.4 | 36.8 +/- 1.1 | 37.3 +/- 1.4 |
+| 2 | 56.6 +/- 2.8 | 53.6 +/- 1.3 | 56.0 +/- 2.7 | 54.8 +/- 2.3 | 52.6 +/- 2.6 | 55.2 +/- 1.7 | 54.6 +/- 1.7 |
+| 4 | 55.7 +/- 1.1 | 76.0 +/- 3.6 | 79.1 +/- 1.0 | 79.1 +/- 5.0 | 81.2 +/- 2.8 | 78.6 +/- 4.4 | 77.6 +/- 0.7 |
+| 8 | 54.8 +/- 1.4 | 78.2 +/- 2.6 | 96.7 +/- 3.2 | 108.2 +/- 1.6 | 110.6 +/- 1.8 | 109.4 +/- 3.6 | 110.1 +/- 2.4 |
+| 16 | 56.5 +/- 2.0 | 77.1 +/- 1.3 | 95.0 +/- 3.7 | 113.4 +/- 3.1 | 152.0 +/- 1.1 | 149.0 +/- 2.2 | 145.5 +/- 7.6 |
+| 32 | 53.5 +/- 1.3 | 74.9 +/- 1.6 | 97.4 +/- 1.8 | 109.6 +/- 1.6 | 151.5 +/- 2.2 | 177.4 +/- 3.0 | 172.0 +/- 12.5 |
+| 64 | 53.7 +/- 2.8 | 77.4 +/- 0.8 | 98.4 +/- 6.1 | 111.7 +/- 1.6 | 149.5 +/- 1.6 | 180.0 +/- 1.7 | 179.7 +/- 2.5 |
+
+**The cap costs nothing when it does not bind.** Read the table across each row: at
+offered load 1 every cap gives 36-38 tokens/s, at 4 every cap of 4 or more gives 77-81,
+at 8 every cap of 8 or more gives 108-111. A larger cap is never worse at any offered
+load, it only adds headroom above. So `seqs32` dominates the shipped `seqs8` rather than
+trading against it, and the intuition that a smaller cap should protect responsiveness
+is wrong on this stack. The row at offered load 1 is also seven independent measurements
+of the same quantity, spread 1.9 tokens/s, which is a useful check on the measurement
+itself.
+
+**Aggregate throughput saturates at 32.** Peaks are 56.6, 76.0, 96.7, 113.4, 152.0,
+180.0 and 179.7 tokens/s for caps 2 through 64. Caps 32 and 64 differ by 0.3 tokens/s,
+far inside the A7 resolvability threshold, so 32 is the last cap that buys anything.
+Batching is worth **4.9x** over single stream, which qualifies A5's reading: a decode
+step that is 86.2% GPU-busy was not compute-saturated but bandwidth-bound, and batching
+amortises the weight reads.
+
+**The cost is entirely latency, and it is a property of offered load, not of the cap.**
+Per-stream throughput falls from 39.8 tokens/s at offered load 1 to 7.9 at 32. But
+end-to-end latency at fixed offered load is roughly cap-independent, because the work is
+the same either way: 16 requests against cap 8 take 10.3 s to first token and then 16.6
+tokens/s, while against cap 16 they take 2.6 s and then 11.3 tokens/s, or about 25 s in
+total each way. The cap chooses where the queue forms, not how much work there is.
+
+Hypothesis outcomes:
+
+- **H1, queueing: confirmed**, and it is the whole of the reported symptom. Past the
+  cap, aggregate is flat and time-to-first-token explodes -- cap 8 at offered load 16 is
+  10.3 s mean, and cap 64 at offered load 64 is 37.9 s mean and 75.4 s at p99.
+- **H2, speculative verify cost: rejected as an acceptance effect.** Mean accepted
+  length is 2.48-2.59 across every cap and every offered load, so batch size does not
+  move MTP acceptance at all. Whatever the verify costs at large batch, it is compute,
+  not acceptance, and `num_speculative_tokens_per_batch_size` is not indicated.
+- **H3, the PLE gather helping: not supported.** Scaling is sublinear throughout, with
+  no superlinear region that would indicate the gather benefiting from queue depth.
+- **H4, KV pressure: ruled out for this workload, but only for this workload.** Zero
+  preemptions at every point. That is because prompts were 550 tokens: 746,756 KV tokens
+  over 32 sequences leaves about 23,000 each, ample here. See the caveat below.
+- **H5, graph fallback: ruled out.** Capture tracks the cap -- 35 sizes, 0.36 GiB, 35 s.
+
+Two caveats limit how far this generalises. Prompts were 550 tokens and outputs exactly
+256, so the zero-preemption result says nothing about long contexts: at cap 32 the KV
+allocation is about 23,000 tokens per sequence, and concurrent requests above that would
+preempt, which is the one real argument for a smaller cap on agentic traffic near the
+262,144-token limit. And `output_throughput` here divides by wall clock including
+prefill, so the offered-load-1 figure of 36-38 tokens/s is not comparable with the 48.54
+tokens/s of A7's decode probe; nothing regressed between the two.
+
 ### Best validated configuration
 
 The production choice after these experiments is:
@@ -843,6 +907,7 @@ image=qwen38-ar:base (Saren-Arterius/qwen3.8-Flash-DGX-AutoRound @ ae4e8e6)
 target=Saren/Qwen3.8-Flash-Next-W4A16-AutoRound-hybrid
 ple=Saren/Qwen3.8-Flash-Next-ple-table-fp8, separate mmap dir
 mtp=4
+max_num_seqs=32
 lm_head=int8 GPTQ-Marlin, shared with the MTP head
 VLLM_PLE_MMAP_FAST_ROWS=0
 VLLM_PLE_MMAP_MADV_RANDOM=1
@@ -909,8 +974,10 @@ and should not be combined into one improvement claim.
   the drafter's MoE runs bf16 and costs one bf16 GEMM per draft position.
 - **A9:** Port `d37e4f0` draft top-k/top-p replay onto the AutoRound stack. Both
   benchmarks here are greedy, so S1's 10% is currently unmeasured on this target.
-- **C1 (prepared):** Concurrency and the admission cap. `max_num_seqs=8` is inherited
-  from the fork and unexamined; every result in this log is single-stream.
+- **C1 (successful):** Raising `max_num_seqs` from 8 to 32 lifts peak aggregate
+  throughput from 113 to 180 tokens/s and costs nothing at any offered load. Caps above
+  32 buy nothing. The reported "gives up under parallel load" symptom is queueing, and a
+  smaller cap makes it worse rather than better.
 - **A10:** Greedy decoding is nondeterministic on this stack
   (`VLLM_MARLIN_USE_ATOMIC_ADD=1`). Repeated identical prompts give different answers,
   which is both a quality question and the reason measurement spread is 4-5 tokens/s.
