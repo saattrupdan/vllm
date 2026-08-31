@@ -889,9 +889,9 @@ Hypothesis outcomes:
   not produce superlinear aggregate scaling, because compute still grows with batch, so
   sublinearity is no evidence either way. The right instrument is the fault rate, which
   this sweep never captured. @jschmied measured it directly on a GB10 and found major
-  faults per token falling 16.0 to 3.6, a 4.4x drop from 1 to 48 streams, with the gather
-  never exceeding about 25% of one CPU core. H3 should be treated as supported on that
-  evidence, not on ours.
+  faults per token falling 16.0 to 3.6, a 4.4x drop from 1 to 48 streams, with the
+  gather never exceeding about 25% of one CPU core. H3 should be treated as supported on
+  that evidence, not on ours.
 - **H4, KV pressure: ruled out for this workload, but only for this workload.** Zero
   preemptions at every point. That is because prompts were 550 tokens: 746,756 KV tokens
   over 32 sequences leaves about 23,000 each, ample here. See the caveat below.
@@ -911,22 +911,22 @@ commit this log pins. They agree with C1 on the mechanism and disagree on the ce
 | 32 | 212.0 | 6.6 | 4.3 |
 | 48 | **266.8** | 5.6 | 3.6 |
 
-Absolute rates are not comparable: their run is RadixArk NVFP4 at 8k context using vLLM's
-native PLE CPU offload rather than this repo's mmap, and crucially **without speculative
-decoding**. The shapes are what matter. On H1 they independently reproduce C1 exactly --
-at `--max-num-seqs 2` their sweep flatlines near 33 tokens/s while
-`vllm:request_queue_time_seconds_sum` climbs to 142 s, and their README now warns against
-benchmarking at 1-2 for that reason.
+Absolute rates are not comparable: their run is RadixArk NVFP4 at 8k context using
+vLLM's native PLE CPU offload rather than this repo's mmap, and crucially **without
+speculative decoding**. The shapes are what matter. On H1 they independently reproduce
+C1 exactly -- at `--max-num-seqs 2` their sweep flatlines near 33 tokens/s while
+`vllm:request_queue_time_seconds_sum` climbs to 142 s, and their README now warns
+against benchmarking at 1-2 for that reason.
 
 The disagreement is the ceiling, and it is the most valuable thing here. C1 plateaus at
 180 tokens/s by cap 32; they are still climbing at 48 streams and reach 266.8. The
 salient difference is MTP. C1's H2 established that batch size does not move MTP
 *acceptance*, but said nothing about the compute cost of verifying `batch * (mtp + 1)`
 tokens per step, and that cost grows with batch while the benefit does not. Their
-no-speculation run climbing past where our MTP-3 run stalls is the first concrete evidence
-that **speculative decoding may be net-negative at high concurrency on this stack**. That
-makes the MTP-versus-cap sweep, deliberately skipped in C1 in favour of repeats, the
-clear next experiment: MTP 0 against MTP 3 at caps 32 and 48.
+no-speculation run climbing past where our MTP-3 run stalls is the first concrete
+evidence that **speculative decoding may be net-negative at high concurrency on this
+stack**. That makes the MTP-versus-cap sweep, deliberately skipped in C1 in favour of
+repeats, the clear next experiment: MTP 0 against MTP 3 at caps 32 and 48.
 
 Two caveats limit how far this generalises. Prompts were 550 tokens and outputs exactly
 256, so the zero-preemption result says nothing about long contexts: at cap 32 the KV
