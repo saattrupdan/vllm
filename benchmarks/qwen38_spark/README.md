@@ -1023,8 +1023,17 @@ and should not be combined into one improvement claim.
   op; full capture remains incompatible with mmap PLE.
 - **K3 (failed):** SM121 skinny-GEMM heads raise step rate but reduce MTP acceptance;
   draft-only mode has no serving speedup.
-- **P1 (partially closed):** A3 threads the decode gather; the remaining ~4 ms is a
-  host stall that must be *overlapped*, not shortened.
+- **P1 (closed, null):** A3 threads the decode gather and concluded the remaining ~4 ms
+  is a host stall that must be *overlapped* rather than shortened. Upstream has since
+  tried exactly that overlap -- `Saren-Arterius` commit `7045994` computes the n-gram hash
+  at batch-assembly time and starts the gather on a worker thread, so the forward pass
+  only pays the H2D copy. It does not work, and for an instructive reason: the window
+  between input preparation and layer 1 is only a few milliseconds, far smaller than the
+  latency worth hiding, so `consume()` still blocks for most of the read while the thread
+  handoff and staging copy cost more than the inline gather they replace. Measured at
+  **-2 to -3 tokens/s on a local-NVMe table**, which is our configuration, and shipped
+  disabled by default. The overlap route is closed; only a faster row source (their RDMA
+  work) or fewer rows would move this.
 - **P2 (closed, null):** A2 shows extra page-cache headroom does not help; the cost is
   fault latency, not fault rate.
 - **A1 (successful):** Intel W4A16 AutoRound int4 target, 45.24 tokens/s at depth 3.
