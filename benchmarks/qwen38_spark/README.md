@@ -929,12 +929,40 @@ stack**. That makes the MTP-versus-cap sweep, deliberately skipped in C1 in favo
 repeats, the clear next experiment: MTP 0 against MTP 3 at caps 32 and 48.
 
 Two caveats limit how far this generalises. Prompts were 550 tokens and outputs exactly
-256, so the zero-preemption result says nothing about long contexts: at cap 32 the KV
-allocation is about 23,000 tokens per sequence, and concurrent requests above that would
-preempt, which is the one real argument for a smaller cap on agentic traffic near the
-262,144-token limit. And `output_throughput` here divides by wall clock including
-prefill, so the offered-load-1 figure of 36-38 tokens/s is not comparable with the 48.54
-tokens/s of A7's decode probe; nothing regressed between the two.
+256, so the zero-preemption result says nothing about long contexts. Note that the cap
+is an admission limit, not a memory reservation: `allocate_slots` draws from one shared
+pool of 746,756 tokens and preemption fires only when an allocation fails, so a larger
+cap does not reduce the KV available to a small number of active requests. Dividing the
+pool by the cap to get a per-sequence budget is wrong except in the worst case where
+every slot is busy at once. The real exposure is narrower: a large cap will *admit* more
+long-context requests than the pool can hold and thrash, where a small cap would have
+queued them. That only bites above the cap's worth of concurrent long-context traffic.
+
+And `output_throughput` here divides by wall clock including prefill, so the
+offered-load-1 figure of 36-38 tokens/s is not comparable with the 48.54 tokens/s of
+A7's decode probe; nothing regressed between the two.
+
+#### Which cap to actually run
+
+The cap only matters at or above the offered load where it binds, so the choice follows
+the workload's peak concurrency and nothing else:
+
+- **Peak concurrency 8 or below:** every cap of 8 or more is indistinguishable. At
+  offered load 8 the caps 8, 16, 32 and 64 give 108.2, 110.6, 109.4 and 110.1 tokens/s;
+  at 4 they give 79.1, 81.2, 78.6 and 77.6; at 1 they all give 36-38. The shipped
+  default of 8 was already right for this regime and C1 is a confirmatory null for it.
+  Caps *below* peak concurrency are the only real mistake -- cap 2 holds offered load 8
+  to 54.8 tokens/s, half of what cap 8 delivers.
+- **Bursts above 8:** a larger cap degrades gracefully where a smaller one queues. At
+  offered load 16, cap 16 gives 152.0 tokens/s at 2.6 s to first token against cap 8's
+  113.4 and 10.3 s. Since a larger cap costs nothing below where it binds, 16 or 32 is
+  free insurance against bursts.
+
+The MTP-versus-cap experiment suggested above is a high-concurrency question only. At
+batch 8 and below the draft passes are close to free and accepted length is a flat 2.5,
+so speculation is still paying there; the no-speculation advantage in upstream's data
+appears at 32 streams and beyond. It is not worth running for a workload that peaks at
+8.
 
 ### Best validated configuration
 
